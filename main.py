@@ -1,10 +1,11 @@
 # main.py - Versão 3.1 (Lógica de Preços 100% Consistente)
 
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, status
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List, Dict, Union
 from datetime import datetime, date
 from google_calendar import get_horarios_disponiveis
+import dateparser  # Para processar datas em linguagem natural
 
 # --- Modelos de Dados ---
 # (Nenhuma mudança aqui)
@@ -13,6 +14,7 @@ class Paciente(SQLModel, table=True):
     sender_id: str = Field(index=True, unique=True)
     nome_completo: Optional[str] = None
     data_criacao: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+    estado_conversa: Optional[str] = Field(default=None, nullable=True)  # Novo campo para controlar o estado da conversa
 
 class TriageRequest(SQLModel):
     senderId: str
@@ -27,12 +29,25 @@ class TriageResponse(SQLModel):
     responseText: str
 
 # --- Configuração do Banco de Dados e Funções ---
-# (Nenhuma mudança aqui)
 DATABASE_URL = "sqlite:///db.sqlite"
-engine = create_engine(DATABASE_URL)
+print(f"\n=== CONFIGURAÇÃO DO BANCO DE DADOS ===")
+print(f"URL do banco: {DATABASE_URL}")
+
+try:
+    engine = create_engine(DATABASE_URL, echo=True)
+    print("Conexão com o banco de dados estabelecida com sucesso!")
+except Exception as e:
+    print(f"ERRO ao conectar ao banco de dados: {e}")
+    raise
 
 def create_db_and_tables():
-    SQLModel.metadata.create_all(engine)
+    try:
+        print("\n=== CRIANDO TABELAS DO BANCO DE DADOS ===")
+        SQLModel.metadata.create_all(engine)
+        print("Tabelas criadas com sucesso!")
+    except Exception as e:
+        print(f"ERRO ao criar tabelas: {e}")
+        raise
 
 def get_session():
     with Session(engine) as session:
@@ -53,12 +68,36 @@ def classify_intent(text: str) -> dict:
         return {"intent": "GREETING", "confidence": 0.9}
     return {"intent": "UNKNOWN", "confidence": 0.3}
 
+def parse_human_date(text: str) -> Optional[date]:
+    """Tenta converter um texto humano (ex: 'amanhã') para uma data."""
+    # Configura o dateparser para entender português e o futuro
+    settings = {'PREFER_DATES_FROM': 'future', 'DATE_ORDER': 'DMY', 'LANGUAGES': ['pt']}
+    parsed_date = dateparser.parse(text, settings=settings)
+    if parsed_date:
+        return parsed_date.date()
+    return None
+
 # --- Lógica do Aplicativo FastAPI ---
-app = FastAPI(
-    title="Triage API",
-    description="API para triagem de pacientes com persistência de dados.",
-    on_startup=[create_db_and_tables]
-)
+print("\n=== INICIALIZANDO FASTAPI ===")
+
+try:
+    app = FastAPI(
+        title="Triage API",
+        description="API para triagem de pacientes com persistência de dados.",
+        on_startup=[create_db_and_tables]
+    )
+    print("Aplicativo FastAPI inicializado com sucesso!")
+except Exception as e:
+    print(f"ERRO ao inicializar o FastAPI: {e}")
+    raise
+
+# Adicionando um manipulador para eventos de inicialização
+@app.on_event("startup")
+async def startup_event():
+    print("\n=== INICIANDO APLICAÇÃO ===")
+    print(f"Versão da API: 3.2")
+    print(f"Banco de dados: {DATABASE_URL}")
+    print("=== PRONTO PARA RECEBER REQUISIÇÕES ===\n")
 
 @app.get("/")
 async def root():
@@ -83,10 +122,54 @@ async def ver_horarios(data: str = Query(..., description="Data no formato AAAA-
 @app.post("/triage", response_model=TriageResponse)
 async def triage(request: TriageRequest, session: Session = Depends(get_session)):
     try:
+        # Limpa o senderId para remover o sufixo do WhatsApp e garantir consistência
         sender_id_limpo = request.senderId.split('@')[0]
-        intent_analysis = classify_intent(request.messageText)
+        
+        # Busca o paciente no banco de dados
         statement = select(Paciente).where(Paciente.sender_id == sender_id_limpo)
         paciente_existente = session.exec(statement).first()
+        
+        # --- LÓGICA DE ESTADO ---
+        # Primeiro, verifica se já estamos no meio de uma conversa
+        if paciente_existente and paciente_existente.estado_conversa == "aguardando_data_agendamento":
+            # O usuário está respondendo a data!
+            data_desejada = parse_human_date(request.messageText)
+            
+            if data_desejada:
+                # Se entendemos a data, buscamos os horários
+                horarios = get_horarios_disponiveis(data_desejada)
+                if horarios:
+                    # Atualiza o estado para o próximo passo
+                    paciente_existente.estado_conversa = "aguardando_escolha_horario"
+                    session.add(paciente_existente)
+                    session.commit()
+                    
+                    horarios_formatados = ", ".join(horarios)
+                    return TriageResponse(
+                        userStatus="existing_patient",
+                        analysis={"intent": "CONTINUE_APPOINTMENT"},
+                        nextAction="present_horarios",
+                        responseText=f"Ótimo! Para o dia {data_desejada.strftime('%d/%m')}, tenho os seguintes horários: {horarios_formatados}. Qual deles você prefere?"
+                    )
+                else:
+                    # Não achamos horários
+                    return TriageResponse(
+                        userStatus="existing_patient",
+                        analysis={"intent": "CONTINUE_APPOINTMENT"},
+                        nextAction="ask_another_date",
+                        responseText=f"Puxa, não encontrei horários disponíveis para {data_desejada.strftime('%d/%m')}. Você gostaria de tentar outra data?"
+                    )
+            else:
+                # Não entendemos a data
+                return TriageResponse(
+                    userStatus="existing_patient",
+                    analysis={"intent": "CONTINUE_APPOINTMENT"},
+                    nextAction="ask_date_again",
+                    responseText="Não consegui entender a data. Por favor, tente dizer de outra forma (ex: 'amanhã', 'dia 15 de junho' ou '15/06')."
+                )
+
+        # Se não estivermos em um estado de conversa, faz a classificação normal de intenção
+        intent_analysis = classify_intent(request.messageText)
 
         if paciente_existente:
             # Lógica para paciente existente (JÁ ESTAVA CORRETA)
