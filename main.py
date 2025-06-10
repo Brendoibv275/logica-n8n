@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Depends, Query, status
 from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List, Dict, Union
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from google_calendar import get_horarios_disponiveis, criar_evento, authenticate_google
 import dateparser  # Para processar datas em linguagem natural
 
@@ -27,8 +27,9 @@ class Agendamento(SQLModel, table=True):
 
 class TriageRequest(SQLModel):
     senderId: str
+    senderName: Optional[str] = None
     messageText: str
-    nomeCompleto: Optional[str] = None
+    timestamp: str
 
 class AgendamentoRequest(BaseModel):
     sender_id_limpo: str
@@ -325,7 +326,9 @@ async def triage(request: TriageRequest, session: Session = Depends(get_session)
             return TriageResponse(userStatus="existing_patient", analysis=intent_analysis, nextAction=next_action, responseText=response_text)
         else:
             # Lógica para novo lead
-            novo_paciente = Paciente(sender_id=sender_id_limpo, nome_completo=request.senderName)
+            # Usar o senderName se disponível, caso contrário, deixar como None
+            nome_paciente = request.senderName if request.senderName else None
+            novo_paciente = Paciente(sender_id=sender_id_limpo, nome_completo=nome_paciente)
             session.add(novo_paciente)
             session.commit()
             session.refresh(novo_paciente)
