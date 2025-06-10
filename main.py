@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException, Depends, Query, status
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List, Dict, Union
 from datetime import datetime, date
-from google_calendar import get_horarios_disponiveis
+from google_calendar import get_horarios_disponiveis, criar_evento, authenticate_google
 import dateparser  # Para processar datas em linguagem natural
 
 # --- Modelos de Dados ---
@@ -14,11 +14,24 @@ class Paciente(SQLModel, table=True):
     sender_id: str = Field(index=True, unique=True)
     nome_completo: Optional[str] = None
     data_criacao: datetime = Field(default_factory=datetime.utcnow, nullable=False)
-    estado_conversa: Optional[str] = Field(default=None, nullable=True)  # Novo campo para controlar o estado da conversa
+    estado_conversa: Optional[str] = Field(default=None, nullable=True)  # Para controlar o estado da conversa
+
+class Agendamento(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    paciente_id: int = Field(foreign_key="paciente.id")
+    data_hora_inicio: datetime
+    data_hora_fim: datetime
+    status: str = Field(default="confirmado")  # Ex: confirmado, cancelado
+    id_evento_google: Optional[str] = None  # Para salvar o ID do evento do Google
 
 class TriageRequest(SQLModel):
     senderId: str
-    senderName: Optional[str] = None
+    messageText: str
+    nomeCompleto: Optional[str] = None
+
+class AgendamentoRequest(SQLModel):
+    sender_id_limpo: str
+    data_hora_str: str  # Formato "AAAA-MM-DD HH:MM"
     messageText: str
     timestamp: str
 
@@ -118,6 +131,57 @@ async def ver_horarios(data: str = Query(..., description="Data no formato AAAA-
         raise HTTPException(status_code=400, detail="Formato de data inválido. Use AAAA-MM-DD.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- NOVO ENDPOINT PARA CRIAR AGENDAMENTOS ---
+@app.post("/agendamentos")
+async def criar_agendamento(request: AgendamentoRequest, session: Session = Depends(get_session)):
+    """
+    Cria um agendamento no banco de dados e no Google Calendar.
+    """
+    paciente = session.exec(select(Paciente).where(Paciente.sender_id == request.sender_id_limpo)).first()
+    if not paciente:
+        raise HTTPException(status_code=404, detail="Paciente não encontrado para o agendamento.")
+
+    try:
+        # Converte a string de data/hora para um objeto datetime
+        inicio = datetime.strptime(request.data_hora_str, '%Y-%m-%d %H:%M')
+        fim = inicio + timedelta(hours=1)  # Duração da consulta de 1 hora
+
+        # Autentica e cria o evento no Google Calendar
+        service = authenticate_google()
+        evento_google = criar_evento(
+            service=service,
+            titulo=f"Consulta - {paciente.nome_completo or 'Novo Paciente'}",
+            data_hora_inicio=inicio,
+            data_hora_fim=fim
+        )
+
+        if not evento_google:
+            raise HTTPException(status_code=500, detail="Não foi possível criar o evento no Google Calendar.")
+
+        # Salva o agendamento no nosso banco de dados local
+        novo_agendamento = Agendamento(
+            paciente_id=paciente.id,
+            data_hora_inicio=inicio,
+            data_hora_fim=fim,
+            id_evento_google=evento_google.get('id')
+        )
+        session.add(novo_agendamento)
+        session.commit()
+
+        return {
+            "status": "sucesso",
+            "detalhes": f"Agendamento para {paciente.nome_completo} criado para {request.data_hora_str}.",
+            "evento_id": evento_google.get('id'),
+            "link_evento": evento_google.get('htmlLink')
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Formato de data/hora inválido. Use o formato AAAA-MM-DD HH:MM. Erro: {str(e)}")
+    except Exception as e:
+        # Em caso de erro, tenta desfazer qualquer alteração no banco de dados
+        session.rollback()
+        raise HTTPException(status_code=500, detail=f"Erro interno ao criar agendamento: {str(e)}")
 
 @app.post("/triage", response_model=TriageResponse)
 async def triage(request: TriageRequest, session: Session = Depends(get_session)):

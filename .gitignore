@@ -12,8 +12,16 @@ ENV/
 *.sqlite
 *.sqlite3
 
-# Environment variables
+# Arquivos de credenciais
 .env
+.env.local
+*.pem
+*.key
+*.crt
+*.p12
+*.p8
+*.json
+credentials.json
 
 # IDE
 .vscode/

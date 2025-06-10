@@ -77,3 +77,25 @@ def get_horarios_disponiveis(data_desejada: datetime.date):
     except HttpError as error:
         print(f'Ocorreu um erro: {error}')
         return []
+
+def criar_evento(service, titulo: str, data_hora_inicio: datetime, data_hora_fim: datetime):
+    """Cria um novo evento na agenda do Google."""
+    evento = {
+        'summary': titulo,
+        'description': 'Agendamento realizado pelo assistente virtual.',
+        'start': {
+            'dateTime': data_hora_inicio.isoformat(),
+            'timeZone': 'America/Sao_Paulo',
+        },
+        'end': {
+            'dateTime': data_hora_fim.isoformat(),
+            'timeZone': 'America/Sao_Paulo',
+        },
+    }
+    try:
+        evento_criado = service.events().insert(calendarId=CALENDAR_ID, body=evento).execute()
+        print(f"Evento criado: {evento_criado.get('htmlLink')}")
+        return evento_criado
+    except HttpError as error:
+        print(f'Ocorreu um erro ao criar o evento: {error}')
+        return None
