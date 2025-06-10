@@ -299,7 +299,7 @@ def ferramenta_processar_data(paciente, mensagem, session):
             }
     return None
 
-def ferramenta_processar_horario(paciente, mensagem, session):
+async def ferramenta_processar_horario(paciente, mensagem, session):
     """Ferramenta para processar o horário escolhido pelo usuário."""
     if paciente.estado_conversa == "aguardando_escolha_horario":
         # Aqui você pode adicionar lógica para validar o formato do horário
@@ -391,7 +391,7 @@ async def agente_router(request: TriageRequest, session: Session = Depends(get_s
         if paciente.estado_conversa == "aguardando_data_agendamento":
             resultado = ferramenta_processar_data(paciente, request.messageText, session)
         elif paciente.estado_conversa == "aguardando_escolha_horario":
-            resultado = ferramenta_processar_horario(paciente, request.messageText, session)
+            resultado = await ferramenta_processar_horario(paciente, request.messageText, session)
         else:
             # Se não houver estado ativo, classifica a intenção
             intent_analysis = classify_intent(request.messageText)
