@@ -115,6 +115,28 @@ async def startup_event():
 async def root():
     return {"status": "API online", "versao": "3.2"}
 
+# Rota para listar todos os pacientes (apenas para depuração)
+@app.get("/pacientes")
+async def listar_pacientes(session: Session = Depends(get_session)):
+    """Lista todos os pacientes cadastrados (apenas para depuração)."""
+    try:
+        pacientes = session.exec(select(Paciente)).all()
+        return [
+            {
+                "id": p.id,
+                "sender_id": p.sender_id,
+                "nome_completo": p.nome_completo,
+                "data_criacao": p.data_criacao.isoformat()
+            }
+            for p in pacientes
+        ]
+    except Exception as e:
+        print(f"Erro ao listar pacientes: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao listar pacientes: {str(e)}"
+        ) from e
+
 # --- NOVO ENDPOINT PARA CONSULTAR AGENDA ---
 @app.get("/horarios_disponiveis")
 async def ver_horarios(data: str = Query(..., description="Data no formato AAAA-MM-DD")):
@@ -137,43 +159,94 @@ async def criar_agendamento(request: AgendamentoRequest, session: Session = Depe
     """
     Cria um agendamento no banco de dados e no Google Calendar.
     """
+    print(f"\n=== INICIANDO CRIAÇÃO DE AGENDAMENTO ===")
+    print(f"Dados recebidos: {request}")
+    
+    # Busca o paciente no banco de dados
     paciente = session.exec(select(Paciente).where(Paciente.sender_id == request.sender_id_limpo)).first()
     if not paciente:
-        raise HTTPException(status_code=404, detail="Paciente não encontrado para o agendamento.")
+        error_msg = f"Paciente não encontrado para o sender_id: {request.sender_id_limpo}"
+        print(error_msg)
+        raise HTTPException(status_code=404, detail=error_msg)
 
     try:
+        print(f"Paciente encontrado: ID={paciente.id}, Nome={paciente.nome_completo}")
+        print(f"Data/Hora recebida: {request.data_hora_str}")
         # Converte a string de data/hora para um objeto datetime
-        inicio = datetime.strptime(request.data_hora_str, '%Y-%m-%d %H:%M')
-        fim = inicio + timedelta(hours=1)  # Duração da consulta de 1 hora
+        try:
+            inicio = datetime.strptime(request.data_hora_str, '%Y-%m-%d %H:%M')
+            fim = inicio + timedelta(hours=1)  # Duração da consulta de 1 hora
+            print(f"Data/Hora convertida: Início={inicio}, Fim={fim}")
+        except ValueError as e:
+            error_msg = f"Formato de data/hora inválido: {request.data_hora_str}. Use o formato AAAA-MM-DD HH:MM"
+            print(error_msg)
+            raise ValueError(error_msg) from e
 
         # Autentica e cria o evento no Google Calendar
-        service = authenticate_google()
-        evento_google = criar_evento(
-            service=service,
-            titulo=f"Consulta - {paciente.nome_completo or 'Novo Paciente'}",
-            data_hora_inicio=inicio,
-            data_hora_fim=fim
-        )
-
-        if not evento_google:
-            raise HTTPException(status_code=500, detail="Não foi possível criar o evento no Google Calendar.")
+        try:
+            print("Autenticando no Google Calendar...")
+            service = authenticate_google()
+            print("Autenticação bem-sucedida. Criando evento...")
+            
+            titulo = f"Consulta - {paciente.nome_completo or 'Novo Paciente'}"
+            print(f"Criando evento: {titulo}")
+            
+            evento_google = criar_evento(
+                service=service,
+                titulo=titulo,
+                data_hora_inicio=inicio,
+                data_hora_fim=fim
+            )
+            
+            if not evento_google:
+                error_msg = "Falha ao criar evento no Google Calendar: Nenhum evento retornado"
+                print(error_msg)
+                raise HTTPException(status_code=500, detail=error_msg)
+                
+            print(f"Evento criado com sucesso! ID: {evento_google.get('id')}")
+            
+        except Exception as e:
+            error_msg = f"Erro ao criar evento no Google Calendar: {str(e)}"
+            print(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg) from e
 
         # Salva o agendamento no nosso banco de dados local
-        novo_agendamento = Agendamento(
-            paciente_id=paciente.id,
-            data_hora_inicio=inicio,
-            data_hora_fim=fim,
-            id_evento_google=evento_google.get('id')
-        )
-        session.add(novo_agendamento)
-        session.commit()
+        try:
+            print("Salvando agendamento no banco de dados local...")
+            novo_agendamento = Agendamento(
+                paciente_id=paciente.id,
+                data_hora_inicio=inicio,
+                data_hora_fim=fim,
+                id_evento_google=evento_google.get('id')
+            )
+            session.add(novo_agendamento)
+            session.commit()
+            print("Agendamento salvo com sucesso no banco de dados local!")
+            
+        except Exception as e:
+            session.rollback()
+            error_msg = f"Erro ao salvar agendamento no banco de dados: {str(e)}"
+            print(error_msg)
+            # Tenta remover o evento do Google Calendar se o salvamento local falhar
+            try:
+                if evento_google and 'id' in evento_google:
+                    print(f"Tentando remover evento {evento_google['id']} do Google Calendar...")
+                    service.events().delete(calendarId='primary', eventId=evento_google['id']).execute()
+                    print("Evento removido do Google Calendar com sucesso.")
+            except Exception as delete_error:
+                print(f"Aviso: Não foi possível remover o evento do Google Calendar: {str(delete_error)}")
+            
+            raise HTTPException(status_code=500, detail=error_msg) from e
 
-        return {
+        # Monta a resposta de sucesso
+        response = {
             "status": "sucesso",
             "detalhes": f"Agendamento para {paciente.nome_completo} criado para {request.data_hora_str}.",
             "evento_id": evento_google.get('id'),
             "link_evento": evento_google.get('htmlLink')
         }
+        print(f"=== AGENDAMENTO CRIADO COM SUCESSO ===\n{response}")
+        return response
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Formato de data/hora inválido. Use o formato AAAA-MM-DD HH:MM. Erro: {str(e)}")
