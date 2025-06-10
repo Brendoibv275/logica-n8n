@@ -256,101 +256,202 @@ async def criar_agendamento(request: AgendamentoRequest, session: Session = Depe
         session.rollback()
         raise HTTPException(status_code=500, detail=f"Erro interno ao criar agendamento: {str(e)}")
 
-@app.post("/triage", response_model=TriageResponse)
-async def triage(request: TriageRequest, session: Session = Depends(get_session)):
+# --- Ferramentas do Agente ---
+
+def ferramenta_agendar_consulta(paciente, mensagem, session):
+    """Ferramenta para iniciar o processo de agendamento de consulta."""
+    if not paciente.estado_conversa or paciente.estado_conversa == "inicio":
+        paciente.estado_conversa = "aguardando_data_agendamento"
+        session.add(paciente)
+        session.commit()
+        return {
+            "resposta": "Vou te ajudar com o agendamento. Qual o melhor dia para você? (ex: amanhã, dia 15/06)",
+            "proximo_estado": "aguardando_data_agendamento"
+        }
+    return None
+
+def ferramenta_processar_data(paciente, mensagem, session):
+    """Ferramenta para processar a data fornecida pelo usuário."""
+    if paciente.estado_conversa == "aguardando_data_agendamento":
+        data_desejada = parse_human_date(mensagem)
+        if data_desejada:
+            horarios = get_horarios_disponiveis(data_desejada)
+            if horarios:
+                paciente.estado_conversa = "aguardando_escolha_horario"
+                paciente.dados_agendamento = {"data": data_desejada.isoformat()}
+                session.add(paciente)
+                session.commit()
+                
+                horarios_formatados = ", ".join(horarios)
+                return {
+                    "resposta": f"Ótimo! Para o dia {data_desejada.strftime('%d/%m')}, tenho os seguintes horários: {horarios_formatados}. Qual deles você prefere?",
+                    "proximo_estado": "aguardando_escolha_horario"
+                }
+            else:
+                return {
+                    "resposta": f"Puxa, não encontrei horários disponíveis para {data_desejada.strftime('%d/%m')}. Você gostaria de tentar outra data?",
+                    "proximo_estado": "aguardando_data_agendamento"
+                }
+        else:
+            return {
+                "resposta": "Não consegui entender a data. Por favor, tente dizer de outra forma (ex: 'amanhã', 'dia 15 de junho' ou '15/06').",
+                "proximo_estado": "aguardando_data_agendamento"
+            }
+    return None
+
+def ferramenta_processar_horario(paciente, mensagem, session):
+    """Ferramenta para processar o horário escolhido pelo usuário."""
+    if paciente.estado_conversa == "aguardando_escolha_horario":
+        # Aqui você pode adicionar lógica para validar o formato do horário
+        try:
+            data_str = paciente.dados_agendamento.get("data")
+            data_hora_str = f"{data_str} {mensagem}"
+            
+            # Cria o agendamento
+            agendamento_request = AgendamentoRequest(
+                sender_id_limpo=paciente.sender_id,
+                data_hora_str=data_hora_str
+            )
+            
+            # Chama o endpoint de criação de agendamento
+            resultado = await criar_agendamento(agendamento_request, session)
+            
+            # Reseta o estado da conversa
+            paciente.estado_conversa = None
+            paciente.dados_agendamento = {}
+            session.add(paciente)
+            session.commit()
+            
+            return {
+                "resposta": f"Pronto! Seu agendamento foi confirmado para {data_hora_str}. "
+                          f"Você receberá uma confirmação por e-mail. Até logo!",
+                "proximo_estado": None
+            }
+            
+        except HTTPException as e:
+            return {
+                "resposta": f"Desculpe, houve um erro ao agendar sua consulta: {e.detail}",
+                "proximo_estado": "aguardando_escolha_horario"
+            }
+    return None
+
+def ferramenta_consulta_preco(paciente, mensagem, session):
+    """Ferramenta para lidar com consultas de preço."""
+    return {
+        "resposta": "Para que eu possa te passar um orçamento preciso e justo, preciso primeiro entender seu caso em uma avaliação clínica. Vamos marcar uma consulta inicial sem compromisso?",
+        "proximo_estado": None
+    }
+
+def ferramenta_saudacao(paciente, mensagem, session):
+    """Ferramenta para lidar com saudações."""
+    if paciente.nome_completo:
+        return {"resposta": f"Olá {paciente.nome_completo}! Em que posso ajudar você hoje?", "proximo_estado": None}
+    return {"resposta": "Olá! Bem-vindo à nossa clínica. Em que posso ajudar você hoje?", "proximo_estado": None}
+
+def ferramenta_padrao(paciente, mensagem, session):
+    """Ferramenta padrão quando nenhuma outra se aplica."""
+    return {
+        "resposta": "Não entendi muito bem. Você gostaria de marcar uma consulta ou saber mais sobre nossos serviços?",
+        "proximo_estado": None
+    }
+
+# --- Novo Endpoint do Agente ---
+
+@app.post("/agente")
+async def agente_router(request: TriageRequest, session: Session = Depends(get_session)):
+    """
+    Este é o cérebro principal do agente. Ele recebe todas as mensagens,
+    analisa o estado e decide qual ferramenta usar.
+    """
     try:
-        # Limpa o senderId para remover o sufixo do WhatsApp e garantir consistência
+        # Limpa o senderId para remover o sufixo do WhatsApp
         sender_id_limpo = request.senderId.split('@')[0]
         
-        # Busca o paciente no banco de dados
-        statement = select(Paciente).where(Paciente.sender_id == sender_id_limpo)
-        paciente_existente = session.exec(statement).first()
+        # Busca o paciente no banco de dados ou cria um novo se não existir
+        paciente = session.exec(select(Paciente).where(Paciente.sender_id == sender_id_limpo)).first()
         
-        # --- LÓGICA DE ESTADO ---
-        # Primeiro, verifica se já estamos no meio de uma conversa
-        if paciente_existente and paciente_existente.estado_conversa == "aguardando_data_agendamento":
-            # O usuário está respondendo a data!
-            data_desejada = parse_human_date(request.messageText)
-            
-            if data_desejada:
-                # Se entendemos a data, buscamos os horários
-                horarios = get_horarios_disponiveis(data_desejada)
-                if horarios:
-                    # Atualiza o estado para o próximo passo
-                    paciente_existente.estado_conversa = "aguardando_escolha_horario"
-                    session.add(paciente_existente)
-                    session.commit()
-                    
-                    horarios_formatados = ", ".join(horarios)
-                    return TriageResponse(
-                        userStatus="existing_patient",
-                        analysis={"intent": "CONTINUE_APPOINTMENT"},
-                        nextAction="present_horarios",
-                        responseText=f"Ótimo! Para o dia {data_desejada.strftime('%d/%m')}, tenho os seguintes horários: {horarios_formatados}. Qual deles você prefere?"
-                    )
-                else:
-                    # Não achamos horários
-                    return TriageResponse(
-                        userStatus="existing_patient",
-                        analysis={"intent": "CONTINUE_APPOINTMENT"},
-                        nextAction="ask_another_date",
-                        responseText=f"Puxa, não encontrei horários disponíveis para {data_desejada.strftime('%d/%m')}. Você gostaria de tentar outra data?"
-                    )
-            else:
-                # Não entendemos a data
-                return TriageResponse(
-                    userStatus="existing_patient",
-                    analysis={"intent": "CONTINUE_APPOINTMENT"},
-                    nextAction="ask_date_again",
-                    responseText="Não consegui entender a data. Por favor, tente dizer de outra forma (ex: 'amanhã', 'dia 15 de junho' ou '15/06')."
-                )
-
-        # Se não estivermos em um estado de conversa, faz a classificação normal de intenção
-        intent_analysis = classify_intent(request.messageText)
-
-        if paciente_existente:
-            # Lógica para paciente existente (JÁ ESTAVA CORRETA)
-            response_text = f"Olá {paciente_existente.nome_completo or 'cliente'}! "
-            if intent_analysis["intent"] == "SCHEDULE_APPOINTMENT":
-                response_text += "Vou te ajudar com o agendamento. Qual o melhor dia e horário para você?"
-                next_action = "schedule_appointment"
-            elif intent_analysis["intent"] == "REQUEST_PRICE":
-                response_text += "Entendo seu interesse nos valores. Para te passar um orçamento preciso e justo, que é o correto, eu preciso primeiro fazer uma avaliação clínica. Vamos marcar uma consulta sem compromisso para eu entender seu caso?"
-                next_action = "pivot_to_schedule"
-            elif intent_analysis["intent"] == "GREETING":
-                response_text += "Em que posso ajudar você hoje?"
-                next_action = "ask_how_can_help"
-            else:
-                response_text += "Não entendi muito bem. Você gostaria de marcar uma consulta ou saber mais sobre nossos serviços?"
-                next_action = "clarify_intent"
-            return TriageResponse(userStatus="existing_patient", analysis=intent_analysis, nextAction=next_action, responseText=response_text)
-        else:
-            # Lógica para novo lead
-            # Usar o senderName se disponível, caso contrário, deixar como None
-            nome_paciente = request.senderName if request.senderName else None
-            novo_paciente = Paciente(sender_id=sender_id_limpo, nome_completo=nome_paciente)
-            session.add(novo_paciente)
+        if not paciente:
+            # Cria um novo paciente
+            paciente = Paciente(
+                sender_id=sender_id_limpo,
+                nome_completo=request.senderName,
+                estado_conversa=None
+            )
+            session.add(paciente)
             session.commit()
-            session.refresh(novo_paciente)
+            session.refresh(paciente)
             
-            response_text = "Olá! Bem-vindo à nossa clínica. "
+            # Mensagem de boas-vindas para novos usuários
+            return {
+                "resposta": "Olá! Bem-vindo à nossa clínica. Em que posso ajudar você hoje?",
+                "nextAction": "ask_how_can_help"
+            }
+        
+        # Verifica se temos um estado de conversa ativo
+        if paciente.estado_conversa == "aguardando_data_agendamento":
+            resultado = ferramenta_processar_data(paciente, request.messageText, session)
+        elif paciente.estado_conversa == "aguardando_escolha_horario":
+            resultado = ferramenta_processar_horario(paciente, request.messageText, session)
+        else:
+            # Se não houver estado ativo, classifica a intenção
+            intent_analysis = classify_intent(request.messageText)
+            
+            # Escolhe a ferramenta com base na intenção
             if intent_analysis["intent"] == "SCHEDULE_APPOINTMENT":
-                response_text += "Antes de agendarmos, preciso de algumas informações. Qual seu nome completo?"
-                next_action = "collect_contact_info"
-
-            # <<< ESTA É A CORREÇÃO QUE FIZEMOS >>>
+                resultado = ferramenta_agendar_consulta(paciente, request.messageText, session)
             elif intent_analysis["intent"] == "REQUEST_PRICE":
-                response_text += "Para que eu possa te passar um orçamento preciso e justo, preciso primeiro entender seu caso em uma avaliação clínica. Vamos marcar uma consulta inicial sem compromisso?"
-                next_action = "pivot_to_schedule"
-
+                resultado = ferramenta_consulta_preco(paciente, request.messageText, session)
             elif intent_analysis["intent"] == "GREETING":
-                response_text += "Em que posso ajudar você hoje?"
-                next_action = "ask_how_can_help"
+                resultado = ferramenta_saudacao(paciente, request.messageText, session)
             else:
-                response_text += "Poderia me dizer como posso ajudar? Por exemplo, gostaria de marcar uma consulta ou saber mais sobre nossos serviços?"
-                next_action = "clarify_intent"
-            return TriageResponse(userStatus="new_lead", analysis=intent_analysis, nextAction=next_action, responseText=response_text)
+                resultado = ferramenta_padrao(paciente, request.messageText, session)
             
+            # Se nenhuma ferramenta específica for aplicada, usa a ferramenta padrão
+            if not resultado:
+                resultado = ferramenta_padrao(paciente, request.messageText, session)
+        
+        # Se tivermos um resultado, retornamos
+        if resultado:
+            return {
+                "resposta": resultado["resposta"],
+                "nextAction": resultado.get("proximo_estado", None)
+            }
+        
+        # Se chegarmos aqui, algo deu errado
+        return {
+            "resposta": "Desculpe, tive um problema ao processar sua mensagem. Poderia tentar novamente?",
+            "nextAction": None
+        }
+        
     except Exception as e:
         session.rollback()
-        raise HTTPException(status_code=500, detail=f"Erro ao processar a requisição: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao processar a requisição: {str(e)}"
+        )
+
+# Mantendo o endpoint /triage para compatibilidade, mas agora ele apenas redireciona para o /agente
+@app.post("/triage", response_model=TriageResponse)
+async def triage(request: TriageRequest, session: Session = Depends(get_session)):
+    """
+    Endpoint de compatibilidade que redireciona para o novo endpoint /agente.
+    Mantido para não quebrar integrações existentes.
+    """
+    try:
+        # Chama o novo endpoint /agente
+        response = await agente_router(request, session)
+        
+        # Converte a resposta para o formato antigo
+        return TriageResponse(
+            userStatus="existing_patient" if "Bem-vindo" not in response["resposta"] else "new_lead",
+            analysis={"intent": "PROCESSED_BY_AGENT"},
+            nextAction=response.get("nextAction", "clarify_intent"),
+            responseText=response["resposta"]
+        )
+    except Exception as e:
+        return TriageResponse(
+            userStatus="error",
+            analysis={"error": str(e)},
+            nextAction="error_handling",
+            responseText="Desculpe, ocorreu um erro ao processar sua solicitação. Por favor, tente novamente mais tarde."
+        )
