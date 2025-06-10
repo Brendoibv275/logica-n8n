@@ -1,6 +1,7 @@
 # main.py - Versão 3.1 (Lógica de Preços 100% Consistente)
 
 from fastapi import FastAPI, HTTPException, Depends, Query, status
+from pydantic import BaseModel
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 from typing import Optional, List, Dict, Union
 from datetime import datetime, date
@@ -29,11 +30,9 @@ class TriageRequest(SQLModel):
     messageText: str
     nomeCompleto: Optional[str] = None
 
-class AgendamentoRequest(SQLModel):
+class AgendamentoRequest(BaseModel):
     sender_id_limpo: str
     data_hora_str: str  # Formato "AAAA-MM-DD HH:MM"
-    messageText: str
-    timestamp: str
 
 class TriageResponse(SQLModel):
     userStatus: str
