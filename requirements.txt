@@ -4,3 +4,6 @@ pydantic==2.5.2
 python-multipart==0.0.6
 sqlmodel==0.0.16
 sqlalchemy==2.0.23
+google-api-python-client==2.108.0
+google-auth-httplib2==0.1.1
+google-auth-oauthlib==1.1.0

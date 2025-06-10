@@ -1,9 +1,10 @@
 # main.py - Versão 3.1 (Lógica de Preços 100% Consistente)
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from sqlmodel import Field, Session, SQLModel, create_engine, select
-from typing import Optional, List, Dict
-from datetime import datetime
+from typing import Optional, List, Dict, Union
+from datetime import datetime, date
+from google_calendar import get_horarios_disponiveis
 
 # --- Modelos de Dados ---
 # (Nenhuma mudança aqui)
@@ -61,7 +62,23 @@ app = FastAPI(
 
 @app.get("/")
 async def root():
-    return {"status": "API online", "versao": "3.1"}
+    return {"status": "API online", "versao": "3.2"}
+
+# --- NOVO ENDPOINT PARA CONSULTAR AGENDA ---
+@app.get("/horarios_disponiveis")
+async def ver_horarios(data: str = Query(..., description="Data no formato AAAA-MM-DD")):
+    """
+    Recebe uma data no formato 'AAAA-MM-DD' e retorna uma lista de
+    horários de início disponíveis (ex: ["09:00", "10:00"]).
+    """
+    try:
+        data_formatada = datetime.strptime(data, '%Y-%m-%d').date()
+        horarios = get_horarios_disponiveis(data_formatada)
+        return {"data": data, "horarios_disponiveis": horarios}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Formato de data inválido. Use AAAA-MM-DD.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/triage", response_model=TriageResponse)
 async def triage(request: TriageRequest, session: Session = Depends(get_session)):
